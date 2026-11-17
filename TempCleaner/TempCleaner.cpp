@@ -340,6 +340,7 @@ int wmain(int argc, wchar_t** argv)
     // 2. Системные папки
     targets.push_back({ ExpandEnv(L"%SystemRoot%\\TEMP"), false });
     targets.push_back({ ExpandEnv(L"%SystemRoot%\\SystemTemp"), false });
+    targets.push_back({ ExpandEnv(L"%SystemRoot%\\SoftwareDistribution"), false });
     targets.push_back({ L"C:\\Temp", false });
 
     // 3. Найденные папки ccmcache - удаляются целиком

@@ -35,6 +35,7 @@ else
 // 2. Системные папки
 targets.Add(new(Environment.ExpandEnvironmentVariables(@"%SystemRoot%\TEMP"), false));
 targets.Add(new(Environment.ExpandEnvironmentVariables(@"%SystemRoot%\SystemTemp"), false));
+targets.Add(new(Environment.ExpandEnvironmentVariables(@"%SystemRoot%\SoftwareDistribution"), false));
 targets.Add(new(@"C:\Temp", false));
 
 // 3. Найденные папки ccmcache (кэш клиента SCCM/ConfigMgr) - удаляются целиком
