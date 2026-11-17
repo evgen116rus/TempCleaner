@@ -1,0 +1,21 @@
+name: build-cpp
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch '\\\.git\\' } | ForEach-Object { $_.FullName }
+          $src = (Get-ChildItem -Recurse -Filter TempCleaner.cpp | Select-Object -First 1).FullName
+          New-Item -ItemType Directory out | Out-Null
+          cl /std:c++17 /EHsc /O2 /MT /utf-8 $src /Fe:out\TempCleaner.exe /Fo:out\
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TempCleaner-cpp
+          path: out/TempCleaner.exe
