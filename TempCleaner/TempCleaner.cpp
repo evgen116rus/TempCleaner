@@ -14,12 +14,14 @@
 #include <fcntl.h>
 #include <io.h>
 
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <iomanip>
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -299,21 +301,390 @@ static void CleanDirectory(const std::wstring& dir, Stats& st, bool dryRun)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Вывод: в консоль - Unicode (WriteConsoleW), в канал/файл (например при запуске
+// через PsExec) - в OEM-кодировке, чтобы русский текст не ломался.
+// ---------------------------------------------------------------------------
+
+class ConsoleBuf : public std::wstreambuf
+{
+public:
+    ConsoleBuf()
+    {
+        out_ = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        isConsole_ = out_ != nullptr && out_ != INVALID_HANDLE_VALUE && GetConsoleMode(out_, &mode);
+    }
+
+protected:
+    int_type overflow(int_type c) override
+    {
+        if (c != traits_type::eof())
+        {
+            const wchar_t ch = static_cast<wchar_t>(c);
+            Write(&ch, 1);
+        }
+        return traits_type::not_eof(c);
+    }
+
+    std::streamsize xsputn(const wchar_t* s, std::streamsize n) override
+    {
+        Write(s, static_cast<size_t>(n));
+        return n;
+    }
+
+private:
+    void Write(const wchar_t* s, size_t n)
+    {
+        if (n == 0 || out_ == nullptr || out_ == INVALID_HANDLE_VALUE) return;
+
+        DWORD written = 0;
+        if (isConsole_)
+        {
+            WriteConsoleW(out_, s, static_cast<DWORD>(n), &written, nullptr);
+            return;
+        }
+
+        const int len = WideCharToMultiByte(CP_OEMCP, 0, s, static_cast<int>(n), nullptr, 0, nullptr, nullptr);
+        if (len <= 0) return;
+        std::string tmp(static_cast<size_t>(len), '\0');
+        WideCharToMultiByte(CP_OEMCP, 0, s, static_cast<int>(n), tmp.data(), len, nullptr, nullptr);
+        WriteFile(out_, tmp.data(), static_cast<DWORD>(tmp.size()), &written, nullptr);
+    }
+
+    HANDLE out_ = nullptr;
+    bool isConsole_ = false;
+};
+
+// Подменяет буфер wcout на время работы программы и возвращает его при выходе
+struct WcoutRedirect
+{
+    ConsoleBuf buf;
+    std::wstreambuf* old;
+    WcoutRedirect() : old(std::wcout.rdbuf(&buf)) {}
+    ~WcoutRedirect()
+    {
+        std::wcout.flush();
+        std::wcout.rdbuf(old);
+    }
+};
+
+static std::wstring Trim(const std::wstring& s)
+{
+    size_t b = 0, e = s.size();
+    while (b < e && std::iswspace(s[b])) ++b;
+    while (e > b && std::iswspace(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+static bool AskYes(const std::wstring& question)
+{
+    std::wcout << question;
+    std::wstring answer;
+    std::getline(std::wcin, answer);
+    answer = Lower(Trim(answer));
+    return answer == L"y" || answer == L"yes" || answer == L"д" || answer == L"да";
+}
+
+static bool EndsWith(const std::wstring& s, const std::wstring& suffix)
+{
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// Читает текстовый файл: UTF-16 LE (с BOM), UTF-8 (с BOM или без), иначе ANSI
+static bool ReadTextFile(const std::wstring& path, std::wstring& out)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart > 16 * 1024 * 1024)
+    {
+        CloseHandle(h);
+        return false;
+    }
+
+    std::string data(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD read = 0;
+    const BOOL ok = data.empty() ? TRUE : ReadFile(h, data.data(), static_cast<DWORD>(data.size()), &read, nullptr);
+    CloseHandle(h);
+    if (!ok) return false;
+    data.resize(read);
+
+    out.clear();
+    if (data.size() >= 2 && static_cast<unsigned char>(data[0]) == 0xFF && static_cast<unsigned char>(data[1]) == 0xFE)
+    {
+        out.resize((data.size() - 2) / 2);
+        if (!out.empty()) memcpy(out.data(), data.data() + 2, out.size() * sizeof(wchar_t));
+        return true;
+    }
+
+    size_t skip = 0;
+    if (data.size() >= 3 && static_cast<unsigned char>(data[0]) == 0xEF &&
+        static_cast<unsigned char>(data[1]) == 0xBB && static_cast<unsigned char>(data[2]) == 0xBF)
+        skip = 3;
+
+    const char* p = data.data() + skip;
+    const int len = static_cast<int>(data.size() - skip);
+    if (len == 0) return true;
+
+    UINT cp = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    int n = MultiByteToWideChar(cp, flags, p, len, nullptr, 0);
+    if (n <= 0)
+    {
+        cp = CP_ACP;
+        flags = 0;
+        n = MultiByteToWideChar(cp, flags, p, len, nullptr, 0);
+    }
+    if (n <= 0) return false;
+
+    out.resize(static_cast<size_t>(n));
+    MultiByteToWideChar(cp, flags, p, len, out.data(), n);
+    return true;
+}
+
+// Формат файла: по одному имени в строке; пустые строки и строки, начинающиеся с # или ;,
+// игнорируются; повторы удаляются; допускается запись вида \\PC-0123.
+static bool ReadComputerList(const std::wstring& path, std::vector<std::wstring>& result, std::wstring& error)
+{
+    std::wstring content;
+    if (!ReadTextFile(path, content))
+    {
+        error = L"Не удалось прочитать файл: " + path;
+        return false;
+    }
+
+    std::set<std::wstring> seen;
+    size_t pos = 0;
+    while (pos <= content.size())
+    {
+        size_t end = content.find(L'\n', pos);
+        if (end == std::wstring::npos) end = content.size();
+        std::wstring line = Trim(content.substr(pos, end - pos));
+        pos = end + 1;
+
+        if (line.empty() || line[0] == L'#' || line[0] == L';') continue;
+        while (!line.empty() && (line.front() == L'\\' || line.front() == L'/')) line.erase(0, 1);
+        if (!line.empty() && seen.insert(Lower(line)).second) result.push_back(line);
+    }
+
+    if (result.empty())
+    {
+        error = L"В файле нет ни одного имени компьютера.";
+        return false;
+    }
+    return true;
+}
+
+// Один компьютер или список из файла
+static bool ParseTargets(const std::wstring& input, std::vector<std::wstring>& result, std::wstring& error)
+{
+    std::wstring text = Trim(input);
+    if (text.size() >= 2 && text.front() == L'"' && text.back() == L'"')
+        text = Trim(text.substr(1, text.size() - 2));
+
+    const DWORD attrs = GetFileAttributesW(text.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return ReadComputerList(text, result, error);
+
+    std::wstring name = text;
+    while (!name.empty() && (name.front() == L'\\' || name.front() == L'/')) name.erase(0, 1);
+
+    const std::wstring lower = Lower(name);
+    if (name.find_first_of(L"\\/:") != std::wstring::npos || EndsWith(lower, L".txt") || EndsWith(lower, L".lst"))
+    {
+        error = L"Файл не найден: " + text;
+        return false;
+    }
+
+    result.push_back(name);
+    return true;
+}
+
+static int RunPse(const std::wstring& pse, const std::wstring& self, const std::wstring& computer, bool dryRun)
+{
+    std::wstring cmd = L"\"" + pse + L"\" \\\\" + computer +
+                       L" -accepteula -nobanner -n 15 -s -c -f \"" + self + L"\" --yes --no-pause";
+    if (dryRun) cmd += L" --dry-run";
+
+    std::wcout << cmd << L"\n\n";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+    {
+        std::wcout << L"Не удалось запустить pse.exe, ошибка Win32: " << GetLastError() << L"\n";
+        return 1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return static_cast<int>(code);
+}
+
+// Запускает эту же программу на удалённых компьютерах через PsExec (файл pse.exe), по очереди.
+// Exe копируется на удалённый компьютер (-c -f) и работает там от SYSTEM (-s)
+// без интерактива: --yes --no-pause. Залогиненный пользователь определяется на месте через WTS.
+// Ошибка на одном компьютере не останавливает обработку остальных.
+static int RunRemote(const std::vector<std::wstring>& computers, bool dryRun, bool confirm)
+{
+    std::vector<std::wstring> valid;
+    for (const auto& c : computers)
+    {
+        bool ok = !c.empty() && c.size() <= 255;
+        for (const wchar_t ch : c)
+        {
+            if (ch < 32 || wcschr(L" \t\"\\/:*?<>|", ch) != nullptr) ok = false;
+        }
+        if (ok) valid.push_back(c);
+        else std::wcout << L"Некорректное имя компьютера, пропуск: " << c << L"\n";
+    }
+    if (valid.empty())
+    {
+        std::wcout << L"Нет компьютеров для запуска.\n";
+        return 1;
+    }
+
+    // SearchPath ищет pse.exe в папке программы, текущей папке, системных папках и в PATH
+    wchar_t pseBuf[MAX_PATH];
+    const DWORD found = SearchPathW(nullptr, L"pse.exe", nullptr, MAX_PATH, pseBuf, nullptr);
+    if (found == 0 || found >= MAX_PATH)
+    {
+        std::wcout << L"Не найден pse.exe. Положите его рядом с программой или в папку из PATH.\n";
+        return 1;
+    }
+
+    wchar_t selfBuf[MAX_PATH];
+    const DWORD selfLen = GetModuleFileNameW(nullptr, selfBuf, MAX_PATH);
+    if (selfLen == 0 || selfLen >= MAX_PATH)
+    {
+        std::wcout << L"Не удалось определить путь к программе.\n";
+        return 1;
+    }
+    const std::wstring pse = pseBuf;
+    const std::wstring self = selfBuf;
+
+    if (!dryRun && confirm)
+    {
+        bool yes;
+        if (valid.size() == 1)
+        {
+            yes = AskYes(L"Запустить очистку на компьютере " + valid[0] + L"? [y/N]: ");
+        }
+        else
+        {
+            std::wcout << L"Компьютеров в списке: " << valid.size() << L"\n";
+            for (size_t i = 0; i < valid.size() && i < 30; ++i) std::wcout << L"  " << valid[i] << L"\n";
+            if (valid.size() > 30) std::wcout << L"  ... и ещё " << valid.size() - 30 << L"\n";
+            yes = AskYes(L"Запустить очистку на всех? [y/N]: ");
+        }
+        if (!yes)
+        {
+            std::wcout << L"Отменено.\n";
+            return 0;
+        }
+    }
+
+    std::vector<std::wstring> failed;
+    for (size_t i = 0; i < valid.size(); ++i)
+    {
+        std::wcout << L"\n=== [" << i + 1 << L"/" << valid.size() << L"] " << valid[i] << L"\n";
+
+        const int code = RunPse(pse, self, valid[i], dryRun);
+        if (code != 0)
+        {
+            failed.push_back(valid[i] + L" (код " + std::to_wstring(code) + L")");
+            std::wcout << L"Ошибка: код завершения " << code << L"\n";
+        }
+    }
+
+    if (valid.size() > 1)
+    {
+        std::wcout << L"\n==============================\n";
+        std::wcout << L"Успешно: " << valid.size() - failed.size() << L" из " << valid.size() << L"\n";
+        if (!failed.empty())
+        {
+            std::wcout << L"С ошибками:\n";
+            for (const auto& f : failed) std::wcout << L"  " << f << L"\n";
+        }
+    }
+
+    return failed.empty() ? 0 : 1;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
-    _setmode(_fileno(stdout), _O_U16TEXT);
+    WcoutRedirect redirect;
     _setmode(_fileno(stdin), _O_U16TEXT);
 
     bool dryRun = false;
     bool autoYes = false;
+    bool noPause = false;
+    bool missingList = false;
+    std::wstring listFile; // параметр --list <файл>
     for (int i = 1; i < argc; ++i)
     {
         if (_wcsicmp(argv[i], L"--dry-run") == 0) dryRun = true;
         else if (_wcsicmp(argv[i], L"--yes") == 0) autoYes = true;
+        else if (_wcsicmp(argv[i], L"--no-pause") == 0) noPause = true;
+        else if (_wcsicmp(argv[i], L"--list") == 0)
+        {
+            if (i + 1 < argc) listFile = argv[++i];
+            else missingList = true;
+        }
     }
+    const bool interactive = !autoYes && !noPause;
 
     std::wcout << L"Очистка временных папок"
                << (dryRun ? L" (пробный запуск, ничего не удаляется)" : L"") << L"\n\n";
+
+    if (missingList)
+    {
+        std::wcout << L"Параметр --list требует путь к файлу.\n";
+        return 1;
+    }
+
+    // Имя компьютера или файл со списком: пусто - запуск локально, иначе - удалённо через pse.exe (PsExec).
+    // В неинтерактивном режиме (--yes / --no-pause, в том числе на удалённой стороне) не спрашиваем.
+    std::wstring targetInput = listFile;
+    if (targetInput.empty() && interactive)
+    {
+        std::wcout << L"Имя компьютера или файл со списком (Enter - этот компьютер): ";
+        std::getline(std::wcin, targetInput);
+        targetInput = Trim(targetInput);
+    }
+
+    if (!targetInput.empty())
+    {
+        std::vector<std::wstring> computers;
+        std::wstring error;
+        int code;
+        if (ParseTargets(targetInput, computers, error))
+        {
+            code = RunRemote(computers, dryRun, !autoYes);
+        }
+        else
+        {
+            std::wcout << error << L"\n";
+            code = 1;
+        }
+
+        if (interactive)
+        {
+            std::wcout << L"\nНажмите любую клавишу для выхода...";
+            _getwch();
+        }
+        return code;
+    }
+
+    if (interactive) std::wcout << L"\n";
 
     wchar_t me[256] = L"?";
     DWORD meLen = 256;
@@ -417,7 +788,7 @@ int wmain(int argc, wchar_t** argv)
                << FormatSize(total.bytes) << L"\n";
     std::wcout << L"Пропущено: " << total.skipped << L"\n";
 
-    if (!autoYes)
+    if (interactive)
     {
         std::wcout << L"\nНажмите любую клавишу для выхода...";
         _getwch();
