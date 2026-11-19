@@ -504,10 +504,11 @@ static bool ParseTargets(const std::wstring& input, std::vector<std::wstring>& r
     return true;
 }
 
-static int RunPse(const std::wstring& pse, const std::wstring& self, const std::wstring& computer, bool dryRun)
+static int RunPse(const std::wstring& pse, const std::wstring& self, const std::wstring& computer,
+                  bool dryRun, const std::wstring& serviceName)
 {
     std::wstring cmd = L"\"" + pse + L"\" \\\\" + computer +
-                       L" -accepteula -nobanner -n 15 -s -c -f \"" + self + L"\" --yes --no-pause";
+                       L" -accepteula -nobanner -n 15 -r " + serviceName + L" -s -c -f \"" + self + L"\" --yes --no-pause";
     if (dryRun) cmd += L" --dry-run";
 
     std::wcout << cmd << L"\n\n";
@@ -533,7 +534,8 @@ static int RunPse(const std::wstring& pse, const std::wstring& self, const std::
 // Exe копируется на удалённый компьютер (-c -f) и работает там от SYSTEM (-s)
 // без интерактива: --yes --no-pause. Залогиненный пользователь определяется на месте через WTS.
 // Ошибка на одном компьютере не останавливает обработку остальных.
-static int RunRemote(const std::vector<std::wstring>& computers, bool dryRun, bool confirm)
+static int RunRemote(const std::vector<std::wstring>& computers, bool dryRun, bool confirm,
+                     const std::wstring& serviceName)
 {
     std::vector<std::wstring> valid;
     for (const auto& c : computers)
@@ -597,7 +599,7 @@ static int RunRemote(const std::vector<std::wstring>& computers, bool dryRun, bo
     {
         std::wcout << L"\n=== [" << i + 1 << L"/" << valid.size() << L"] " << valid[i] << L"\n";
 
-        const int code = RunPse(pse, self, valid[i], dryRun);
+        const int code = RunPse(pse, self, valid[i], dryRun, serviceName);
         if (code != 0)
         {
             failed.push_back(valid[i] + L" (код " + std::to_wstring(code) + L")");
@@ -629,6 +631,8 @@ int wmain(int argc, wchar_t** argv)
     bool noPause = false;
     bool missingList = false;
     std::wstring listFile; // параметр --list <файл>
+    std::wstring serviceName = L"ps_tc"; // параметр --service <имя>: имя службы PsExec (ключ -r)
+    bool missingService = false;
     for (int i = 1; i < argc; ++i)
     {
         if (_wcsicmp(argv[i], L"--dry-run") == 0) dryRun = true;
@@ -639,6 +643,11 @@ int wmain(int argc, wchar_t** argv)
             if (i + 1 < argc) listFile = argv[++i];
             else missingList = true;
         }
+        else if (_wcsicmp(argv[i], L"--service") == 0)
+        {
+            if (i + 1 < argc) serviceName = argv[++i];
+            else missingService = true;
+        }
     }
     const bool interactive = !autoYes && !noPause;
 
@@ -648,6 +657,19 @@ int wmain(int argc, wchar_t** argv)
     if (missingList)
     {
         std::wcout << L"Параметр --list требует путь к файлу.\n";
+        return 1;
+    }
+
+    bool serviceOk = !missingService && !serviceName.empty() && serviceName.size() <= 64;
+    for (const wchar_t c : serviceName)
+    {
+        const bool good = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                          (c >= L'0' && c <= L'9') || c == L'_' || c == L'-';
+        if (!good) serviceOk = false;
+    }
+    if (!serviceOk)
+    {
+        std::wcout << L"Параметр --service требует имя службы (латинские буквы, цифры, _ и -).\n";
         return 1;
     }
 
@@ -668,7 +690,7 @@ int wmain(int argc, wchar_t** argv)
         int code;
         if (ParseTargets(targetInput, computers, error))
         {
-            code = RunRemote(computers, dryRun, !autoYes);
+            code = RunRemote(computers, dryRun, !autoYes, serviceName);
         }
         else
         {

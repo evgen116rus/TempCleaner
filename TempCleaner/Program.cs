@@ -9,6 +9,7 @@ using Microsoft.Win32;
 // Использование:
 //   TempCleaner.exe              - спросит имя компьютера или файл со списком (Enter = этот компьютер)
 //   TempCleaner.exe --list pc.txt - очистка компьютеров из списка (по одному имени в строке) через pse.exe
+//   TempCleaner.exe --service ps_tc - имя службы PsExec на удалённом ПК (по умолчанию ps_tc, ключ -r)
 //   TempCleaner.exe --dry-run    - только показать, что будет удалено
 //   TempCleaner.exe --yes        - очистка без вопросов (локально, для планировщика и PsExec)
 //   TempCleaner.exe --no-pause   - не ждать нажатия клавиши в конце
@@ -47,6 +48,19 @@ if (listIndex >= 0)
     listFile = args[listIndex + 1];
 }
 
+// Параметр --service <имя>: имя службы PsExec на удалённом компьютере (ключ -r), по умолчанию ps_tc
+string serviceName = "ps_tc";
+int serviceIndex = Array.FindIndex(args, a => a.Equals("--service", StringComparison.OrdinalIgnoreCase));
+if (serviceIndex >= 0)
+{
+    if (serviceIndex + 1 >= args.Length || !Regex.IsMatch(args[serviceIndex + 1], @"^[A-Za-z0-9_-]{1,64}$"))
+    {
+        Console.WriteLine("Параметр --service требует имя службы (латинские буквы, цифры, _ и -).");
+        return 1;
+    }
+    serviceName = args[serviceIndex + 1];
+}
+
 // Имя компьютера или файл со списком: пусто - запуск локально, иначе - удалённо через pse.exe (PsExec).
 // В неинтерактивном режиме (--yes / --no-pause, в том числе на удалённой стороне) не спрашиваем.
 string? targetInput = listFile;
@@ -67,7 +81,7 @@ if (!string.IsNullOrEmpty(targetInput))
     }
     else
     {
-        code = RunRemote(computers, dryRun, confirm: !autoYes);
+        code = RunRemote(computers, dryRun, confirm: !autoYes, serviceName);
     }
 
     if (interactive)
@@ -255,7 +269,7 @@ static List<string>? ReadComputerList(string path, out string error)
 // Exe копируется на удалённый компьютер (-c -f) и работает там от SYSTEM (-s)
 // без интерактива: --yes --no-pause. Залогиненный пользователь определяется на месте через WTS.
 // Ошибка на одном компьютере не останавливает обработку остальных.
-static int RunRemote(List<string> computers, bool dryRun, bool confirm)
+static int RunRemote(List<string> computers, bool dryRun, bool confirm, string serviceName)
 {
     var valid = new List<string>();
     foreach (var c in computers)
@@ -313,7 +327,7 @@ static int RunRemote(List<string> computers, bool dryRun, bool confirm)
         Console.WriteLine();
         Console.WriteLine($"=== [{i + 1}/{valid.Count}] {valid[i]}");
 
-        int code = RunPse(pse, self, valid[i], dryRun);
+        int code = RunPse(pse, self, valid[i], dryRun, serviceName);
         if (code != 0)
         {
             failed.Add($"{valid[i]} (код {code})");
@@ -336,10 +350,10 @@ static int RunRemote(List<string> computers, bool dryRun, bool confirm)
     return failed.Count == 0 ? 0 : 1;
 }
 
-static int RunPse(string pse, string self, string computer, bool dryRun)
+static int RunPse(string pse, string self, string computer, bool dryRun, string serviceName)
 {
     var psi = new ProcessStartInfo(pse) { UseShellExecute = false };
-    foreach (var a in new[] { @"\\" + computer, "-accepteula", "-nobanner", "-n", "15", "-s", "-c", "-f", self, "--yes", "--no-pause" })
+    foreach (var a in new[] { @"\\" + computer, "-accepteula", "-nobanner", "-n", "15", "-r", serviceName, "-s", "-c", "-f", self, "--yes", "--no-pause" })
         psi.ArgumentList.Add(a);
     if (dryRun) psi.ArgumentList.Add("--dry-run");
 
